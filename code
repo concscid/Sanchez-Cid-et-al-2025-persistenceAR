@@ -1,0 +1,277 @@
+############METAGENOMIC SEQUENCING: QUALITY CONTROL AND ARG ANNOTATION USING THE CARD DATABASE############
+###Step 1: quality control of short-reads using the criteria described by Minoche et al.
+mkdir 01_QC
+iu-gen-configs samples.txt -o 01_QC
+ls 01_QC/
+Sample_01.ini
+Sample_02.ini
+for ini in 01_QC/*.ini; do iu-filter-quality-minoche $ini; done
+
+####Step 2: conversion to fasta
+cd 01_QC
+for function in *.fastq; do
+fastx_toolkit/fastq_to_fasta -i $function -o $function.fasta -Q33
+done
+mkdir Fasta_File
+mv *.fasta Fasta_File
+
+###Step 3: concatenation of forward and reverse reads (without merging)
+cd Fasta_File
+ls *.fasta > sample_list.txt
+
+while read ligne
+do
+	sed 's/\(.*\)\(_R\).*/\1/' > liste_names.txt
+done < sample_list.txt
+
+nl liste_names.txt | sort --key 2 --unique | cut --fields 2 > liste_unique_names.txt
+
+while read name
+do
+	cat $name'_R1'.fastq.fasta  $name'_R2'.fastq.fasta > ./$name'concatenated'.fasta
+done < liste_noms_uniques.txt
+
+mkdir concatenated
+mv concatenated* concatenated
+
+####Step 4: blast against the CARD database (BacMet database was bacmet.dmnd)
+for file in *.fasta
+do
+diamond blastx --db /databases/card.dmnd --query $file --evalue 0.00001 --out /metals/card_$file -p 16 
+done
+
+mkdir card_results
+mv card* card_results
+cd card_results
+
+for file in *.fasta
+do
+awk '$3>=60 && $4>=33 {print;} $file > filtered_$file
+done
+
+mkdir filtered
+mv filtered* filtered
+cd filtered
+
+for file in *.fasta
+do
+awk '!x[$1]++' $file > besthit_$file
+
+####Step 5: abundance analysis using R
+
+###Input: blast results (filtered) in .tsv format (one file per sample). Two columns: gene (gene names and accession numbers) and count (number of hits) Edit on excel as the example:
+###"gene"	"count"
+###"1"	"gb|AAA25550.1|ARO:3003105|dfrA3"	1
+###"2"	"gb|AAA26793|ARO:3003748|oleC"	1
+
+library(dplyr)
+library(tidyverse)
+
+###Create tables with unique gene columns per sample (do it individually for each sample):
+setwd("CARD")
+arg<-read.table(file ="D0_C1.txt", header = TRUE, sep = "\t")
+arg2 <- arg %>% group_by(gene)
+arg3 <- arg2 %>% summarise(n = n())
+colnames(arg3)<-colnames(arg)
+write.table(arg3, "D0_C1.tsv", sep ="\t")
+
+setwd("../")
+filenames<- list.files("CARD", pattern = "*.tsv", full.names=TRUE)
+ldf<-lapply(filenames, read.delim, fill=TRUE, header=TRUE)
+names(ldf)=str_remove(filenames,"^.*/")
+ldf2<-imap_dfr(ldf, ~cbind(.x,sample=.y))
+tab2<-pivot_wider(ldf2, names_from=sample, values_from=count, values_fill=0)
+write.table(tab2, "arg_counts.txt")
+
+###Gene counts were normalized per sequencing depth and plotted using GraphPad 9
+
+############16S rRNA GENE SEQUENCE TREATMENT AND RICHNESS ESTIMATION############
+
+####DADA2 for 16S sequence treatment
+
+library(dada2)
+
+path <- "persistence/16S"
+database <- "/databases/rdp_train_set_18.fa.gz"
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, trimLeft=c(19,20), truncLen=c(240,200),
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+write.table(out, "trimming.txt")
+
+### Dereplication
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+
+###DADA algorithm
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+### Sample Inference
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+
+####Merging
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+
+
+###Create ASV table
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+slen<-table(nchar(getSequences(seqtab)))
+write.table(slen, "sequencelength.txt")
+
+seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% 200:300]
+
+####Remove chimeras
+
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method="consensus", multithread=TRUE, verbose=TRUE)
+
+###Know how many reads made it through all the steps
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+write.table(track, "stats.txt")
+
+## Give Seq headers more manageable names
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+## Make and writing out a fasta of the final ASV seqs
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "out_ASVs.fa")
+
+## ASV count table 
+asv_tab <- t(seqtab.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "out_ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+
+### Assign taxonomy - Bayesian classifier
+taxa <- assignTaxonomy(seqtab.nochim, database, multithread=TRUE)
+row.names(taxa) <- sub(">", "", asv_headers)
+write.table(taxa, file = "out_taxa.txt", append = FALSE, quote = TRUE, sep = "\t")
+
+################################################################################################
+
+########16S rRNA gene sequence analysis (after sequence treatment using DADA2)#####
+########All the steps are done using R
+
+library("phyloseq")
+OTU = otu_table(otumat, taxa_are_rows = TRUE)
+TAX = tax_table(taxmat)
+physeq = phyloseq(OTU, TAX)
+
+####Clean-up output from DADA2 using Phyloseq
+
+######Take out sequences that have not been annotated at least to the class level, as well as chloroplasts
+physeq_class <- subset_taxa(physeq, Class != "NA")
+physeq_class2 <- subset_taxa(physeq_class, Class != "Chloroplast")
+
+####Remove ASVs with less than 10 total copies (taking all samples into account)
+physeq_class3 = prune_samples(sample_sums(physeq_class2)>=10, physeq_class2)
+###Save cleaned-up ASV abundance table and associated taxonomy
+OTU = as(otu_table(physeq_class3), "matrix")
+write.table(OTU, "otu_asvs_classlevel.txt")
+TAXA = as(tax_table(physeq_class3), "matrix")
+write.table(TAXA, "taxa_asvs_classlevel.txt")
+
+#####Estimate ASV richness
+library(vegan)
+richness<-estimateR(OTU)
+write.table(richness,"Estimated_richness.txt") 
+
+
+##############################################GENOME ANALYSES ON ISOLATES: GENOME ASSEMBLY AND ARG IDENTIFICATION##########################################
+###The workflow and code used, except blasts against specific databases, are all part of anvi'o (see the official website for more information): https://anvio.org/ 
+
+###Before starting: put fastq pair-end read files in a folder named 00_RAW and a create a .txt file that contains sample names in the first column, the pathway to R1 files in the second column and the pathway to R2 files in the third column.
+
+conda activate anvio-8
+
+###Step 1: quality control of short-reads using the criteria described by Minoche et al.
+mkdir 01_QC
+iu-gen-configs samples.txt -o 01_QC
+ls 01_QC/
+Sample_01.ini
+Sample_02.ini
+for ini in 01_QC/*.ini; do iu-filter-quality-minoche $ini; done
+
+###Step 2: metagenomic short-read assembly using MEGAHIT (one assembly per sample)
+cd 01_QC
+
+megahit -1 sample1-QUALITY-PASSED_R1.fastq.gz -2 sample1_R2-QUALITY-PASSED.fastq.gz --min-contig-len 1000 -o /megahit -t 16 --k-list 21,41,61,81,99
+cd ../
+cd 
+anvi-script-reformat-fasta final.contigs.fa -o contigs.fa --simplify-names --report-file rename.txt
+
+####Step 3: mapping of short reads onto contigs using Bowtie2
+cd ../
+NUM_THREADS=16
+mkdir 04_MAPPING
+bowtie2-build megahit/contigs.fa 04_MAPPING/contigs
+
+for sample in $names
+do
+bowtie2 --threads $NUM_THREADS -x 04_MAPPING/contigs -1 /01_QC/sample1-QUALITY_PASSED_R1.fastq -2 /01_QC/sample1-QUALITY_PASSED_R2.fastq --no-unal -S 04_MAPPING/$sample.sam
+samtools view -F 4 -bS 04_MAPPING/$sample.sam > 04_MAPPING/$sample-RAW.bam
+anvi-init-bam 04_MAPPING/$sample-RAW.bam -o 04_MAPPING/$sample.bam
+rm 04_MAPPING/$sample.sam 04_MAPPING/$sample-RAW.bam
+done
+
+###Step 4: create a contig database from the contig file
+anvi-gen-contigs-database -f /megahit/contigs.fa -o contigs.db -n 'sample_1'
+######Estimate taxonomy using Centrifuge
+anvi-run-scg-taxonomy -c contigs.db
+
+
+####Step 5: Create individual profiles for each sample
+mkdir 05_PROFILES
+for sample in $names ; do anvi-profile -c contigs.db -i 04_MAPPING/sample_1.bam --sample-name sample_1 --min-contig-length 1000 --output-dir 05_PROFILES/sample_1 ; done 
+
+###Contig visualization on anvi'o
+anvi-interactive -p PROFILE.db -c contigs.db
+
+###Step 7: Binning, genome reconstruction and refinement. Binning is done manually based on differential coverage. Bins are stored manually using the anvi'o interactive platform (for more information refer to the anvi'o website)
+###Bin refinement on the interactive platform (-C name of the bin collection, -b name of the bin):
+anvi-refine -p PROFILE.db -c contigs.db -C bins -b Bin_1
+###Refined bins are stored manually based on differential coverage and sequence composition using the interactive platform and summarized using:
+anvi-summarize -c contigs.db -p PROFILE.db -C bins
+
+source deactivate anvio_env
+
+##The summary generated contains all the relevant information (genome abundance, completion, redundancy) that was used in this study. Plots were obtained using GraphPad Prism 9
+
+####Step 8: Annotation of genes of interest in the genomes 
+#### 7.1 Diamond blast against CARD
+###Blast the contig sequences against the database and filter based on aminoacid identity (>60%) and alignment length (>100 aa) - choose best-hit
+
+diamond blastx --db /databases/card.dmnd --query sample_1-contigs.fa --evalue 0.00001 --out /card/card_contigs_sample_1.txt -p 16 
+awk '$3>=60 && $4>=100 {print;} card_contigs_sample_1.txt > filtered_card_sample_1.txt
+awk '!x[$1]++' filtered_card_sample_1.txt > besthit_card_sample_1.txt
+
+#####Gene annotations (efflux pump, specific ARGs...) were obtained from the CARD database.
